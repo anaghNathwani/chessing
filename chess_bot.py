@@ -406,75 +406,23 @@ def suggest_mode(bot: ChessBot, macos: MacOSChessInterface) -> None:
         print("\nStopped.")
 
 
-def auto_mode(
-    bot: ChessBot,
-    macos: MacOSChessInterface,
-    play_as: str = "white",
-) -> None:
+def auto_mode(bot: ChessBot, play_as: str = "white") -> None:
     """
-    Fully automated: bot reads board state from macOS Chess via AppleScript
-    and plays moves back into the app automatically.
-
-    Falls back to interactive terminal mode if FEN reading is unsupported.
+    Physically control macOS Chess — reads the board via screenshots,
+    clicks pieces to make moves, and waits for the opponent via screen diff.
     play_as: 'white' | 'black'
     """
-    print(f"\n{_DIVIDER}")
-    print(f"  Auto Mode  ·  Bot plays {play_as.capitalize()} vs macOS Chess")
-    print(f"{_DIVIDER}\n")
-
-    macos.activate()
-    bot_color = chess.WHITE if play_as == "white" else chess.BLACK
-    last_fen: Optional[str] = None
+    try:
+        from macos_gui import play as gui_play
+    except ImportError as exc:
+        sys.exit(
+            f"\nGUI automation requires extra packages:\n"
+            f"  pip install pyautogui numpy pillow\n"
+            f"Error: {exc}\n"
+        )
 
     try:
-        while True:
-            fen = macos.get_fen()
-
-            if fen is None:
-                print(
-                    "macOS Chess does not expose its board position via AppleScript\n"
-                    "on this version of macOS.\n\n"
-                    "Falling back to interactive terminal mode.\n"
-                    "Enter the opponent's moves manually when prompted.\n"
-                )
-                interactive_mode(bot, play_as)
-                return
-
-            if fen == last_fen:
-                time.sleep(0.5)
-                continue
-
-            last_fen = fen
-
-            try:
-                bot.apply_fen(fen)
-            except Exception as exc:
-                print(f"FEN parse error: {exc}")
-                continue
-
-            if bot.is_game_over:
-                bot.display()
-                _print_outcome(bot.outcome)
-                break
-
-            if bot.board.turn != bot_color:
-                # Opponent's turn — wait for their move
-                time.sleep(0.4)
-                continue
-
-            print(f"Move {bot.board.fullmove_number} ({bot.turn}): thinking…")
-            move = bot.best_move()
-            san = bot.board.san(move)
-            uci = move.uci()
-
-            if macos.make_move(uci):
-                print(f"  Played: {san}")
-            else:
-                print(f"  Auto-play failed for {san} ({uci}).")
-                print(f"  Please play this move manually: {san}")
-
-            time.sleep(0.4)
-
+        gui_play(bot, play_as=play_as, think_time=bot.think_time)
     except KeyboardInterrupt:
         print("\nStopped.")
 
@@ -494,8 +442,8 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog="""
 modes:
   interactive  Play in this terminal — enter moves, bot replies  (default)
-  auto         Auto-play against macOS Chess via AppleScript
-  suggest      Watch macOS Chess and print best moves for each position
+  auto         Physically control macOS Chess via mouse (screenshot + click)
+  suggest      Watch macOS Chess via AppleScript and print best moves
 
 examples:
   python chess_bot.py
@@ -559,7 +507,7 @@ def main() -> None:
         elif args.mode == "suggest":
             suggest_mode(bot, MacOSChessInterface())
         elif args.mode == "auto":
-            auto_mode(bot, MacOSChessInterface(), args.color)
+            auto_mode(bot, args.color)
 
 
 if __name__ == "__main__":
