@@ -6,7 +6,7 @@ screenshot diffs, and physically clicks pieces to make the bot's moves.
 
 Requires:
     pip install pyautogui numpy pillow
-    pip install google-generativeai          # for Gemini board-state verification
+    python3 -m pip install google-generativeai   # for Gemini board-state verification
     System Settings → Privacy & Security → Accessibility → enable Terminal
 """
 
@@ -554,8 +554,9 @@ class GeminiVision:
             import google.generativeai as genai  # type: ignore[import]
         except ImportError:
             sys.exit(
-                "\nGemini Vision requires the Google AI SDK:\n"
-                "  pip install google-generativeai\n"
+                "\nGemini Vision requires the Google AI SDK.\n"
+                "Install it into the same Python that runs this script:\n"
+                "  python3 -m pip install google-generativeai\n"
             )
         genai.configure(api_key=api_key)
         self._model = genai.GenerativeModel(model)
