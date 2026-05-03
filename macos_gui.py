@@ -79,8 +79,187 @@ def activate_chess() -> None:
     time.sleep(0.8)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Game setup — open app, max difficulty, new game
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _set_max_difficulty_via_menu() -> bool:
+    """
+    Game menu → Computer Level → click the last (highest) enabled item.
+    Returns True on success.
+    """
+    result = _applescript(
+        'tell application "System Events"\n'
+        '    tell process "Chess"\n'
+        '        try\n'
+        '            tell menu bar 1\n'
+        '                tell menu bar item "Game"\n'
+        '                    tell menu "Game"\n'
+        '                        tell menu item "Computer Level"\n'
+        '                            tell menu "Computer Level"\n'
+        '                                set lvls to every menu item whose enabled is true\n'
+        '                                click last item of lvls\n'
+        '                            end tell\n'
+        '                        end tell\n'
+        '                    end tell\n'
+        '                end tell\n'
+        '            end tell\n'
+        '            return "ok"\n'
+        '        on error errMsg\n'
+        '            return errMsg\n'
+        '        end try\n'
+        '    end tell\n'
+        'end tell'
+    )
+    return result == "ok"
+
+
+def _set_max_difficulty_via_prefs() -> bool:
+    """
+    Open Preferences (⌘,), drag the Computer Level slider to its maximum,
+    then close the window.  Returns True on success.
+    """
+    # Open Preferences
+    _applescript(
+        'tell application "System Events"\n'
+        '    tell process "Chess"\n'
+        '        keystroke "," using command down\n'
+        '    end tell\n'
+        'end tell'
+    )
+    time.sleep(0.9)
+
+    result = _applescript(
+        'tell application "System Events"\n'
+        '    tell process "Chess"\n'
+        '        try\n'
+        '            tell window 1\n'
+        '                set maxVal to maximum value of slider 1\n'
+        '                set value of slider 1 to maxVal\n'
+        '            end tell\n'
+        '            return "ok"\n'
+        '        on error errMsg\n'
+        '            return errMsg\n'
+        '        end try\n'
+        '    end tell\n'
+        'end tell'
+    )
+    time.sleep(0.3)
+
+    # Close Preferences window
+    _applescript(
+        'tell application "System Events"\n'
+        '    tell process "Chess"\n'
+        '        keystroke "w" using command down\n'
+        '    end tell\n'
+        'end tell'
+    )
+    time.sleep(0.4)
+    return result == "ok"
+
+
+def _start_new_game_dialog(play_as: str) -> None:
+    """
+    Trigger New Game (⌘N), configure the sheet/dialog for the right
+    game type, and confirm.
+
+    play_as 'white' → Human vs Computer
+    play_as 'black' → Computer vs Human
+    """
+    _applescript(
+        'tell application "System Events"\n'
+        '    tell process "Chess"\n'
+        '        keystroke "n" using command down\n'
+        '    end tell\n'
+        'end tell'
+    )
+    time.sleep(1.2)
+
+    # The new-game sheet has a popup button that controls game type.
+    # Try to set it directly; if that fails, click through the popup manually.
+    game_type = "Human vs Computer" if play_as == "white" else "Computer vs Human"
+
+    set_result = _applescript(
+        f'tell application "System Events"\n'
+        f'    tell process "Chess"\n'
+        f'        try\n'
+        f'            tell window 1\n'
+        f'                set value of pop up button 1 to "{game_type}"\n'
+        f'            end tell\n'
+        f'            return "ok"\n'
+        f'        on error errMsg\n'
+        f'            return errMsg\n'
+        f'        end try\n'
+        f'    end tell\n'
+        f'end tell'
+    )
+
+    if set_result != "ok":
+        # Fallback: click the popup to open it, then click the right menu item
+        _applescript(
+            f'tell application "System Events"\n'
+            f'    tell process "Chess"\n'
+            f'        try\n'
+            f'            tell window 1\n'
+            f'                click pop up button 1\n'
+            f'                delay 0.4\n'
+            f'                click menu item "{game_type}" of menu 1 of pop up button 1\n'
+            f'            end tell\n'
+            f'        end try\n'
+            f'    end tell\n'
+            f'end tell'
+        )
+        time.sleep(0.4)
+
+    # Click the "Play" button (some macOS versions use "OK")
+    _applescript(
+        'tell application "System Events"\n'
+        '    tell process "Chess"\n'
+        '        try\n'
+        '            tell window 1\n'
+        '                click button "Play"\n'
+        '            end tell\n'
+        '        on error\n'
+        '            try\n'
+        '                tell window 1\n'
+        '                    click button "OK"\n'
+        '                end tell\n'
+        '            end try\n'
+        '        end try\n'
+        '    end tell\n'
+        'end tell'
+    )
+    time.sleep(1.0)
+
+
+def setup_game(play_as: str = "white") -> None:
+    """
+    Full automated setup:
+      1. Launch Chess.app
+      2. Set computer difficulty to maximum
+      3. Start a new game with the correct human/computer sides
+    """
+    print("Launching Chess.app…")
+    _applescript('tell application "Chess" to activate')
+    time.sleep(1.2)
+
+    print("Setting difficulty to maximum…")
+    if not _set_max_difficulty_via_menu():
+        # Menu approach failed (e.g. no game is loaded yet) — try Preferences
+        if _set_max_difficulty_via_prefs():
+            print("  (used Preferences slider)")
+        else:
+            print("  Warning: could not set difficulty automatically.")
+            print("  Please set Computer Level to maximum in Chess → Game menu.")
+    time.sleep(0.3)
+
+    print("Starting new game…")
+    _start_new_game_dialog(play_as)
+    print("Game started.\n")
+
+
 def new_game() -> None:
-    """Start a new game in Chess.app via Cmd+N."""
+    """Start a new game in Chess.app via Cmd+N (no setup)."""
     activate_chess()
     _applescript(
         'tell application "System Events"\n'
@@ -355,8 +534,7 @@ def play(bot: object, play_as: str = "white", think_time: float = 5.0) -> None:
     play_as   : 'white' or 'black'
     think_time: seconds Stockfish gets per move
     """
-    print("\nActivating Chess.app…")
-    activate_chess()
+    setup_game(play_as)
 
     wx, wy, ww, wh = get_window_bounds()
     geo = detect_board(wx, wy, ww, wh)
@@ -369,8 +547,8 @@ def play(bot: object, play_as: str = "white", think_time: float = 5.0) -> None:
 
     bot_color = chess.WHITE if play_as == "white" else chess.BLACK
 
-    # Give the user a moment to ensure the game is ready
-    time.sleep(1.5)
+    # Brief pause to let the board fully render after setup
+    time.sleep(1.0)
 
     while not bot.is_game_over:  # type: ignore[attr-defined]
         current_board: chess.Board = bot.board  # type: ignore[attr-defined]
