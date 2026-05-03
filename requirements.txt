@@ -2,3 +2,4 @@ python-chess>=1.10.0
 pyautogui>=0.9.54
 numpy>=1.24.0
 Pillow>=10.0.0
+google-generativeai>=0.8.0

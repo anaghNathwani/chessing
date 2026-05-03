@@ -6,6 +6,7 @@ screenshot diffs, and physically clicks pieces to make the bot's moves.
 
 Requires:
     pip install pyautogui numpy pillow
+    pip install google-generativeai          # for Gemini board-state verification
     System Settings → Privacy & Security → Accessibility → enable Terminal
 """
 
@@ -496,6 +497,122 @@ def infer_move(
     return None
 
 
+def _move_from_board_diff(
+    before: chess.Board,
+    after_fen: str,
+) -> Optional[chess.Move]:
+    """
+    Walk every legal move from *before* and return the one whose resulting
+    board-FEN matches *after_fen* (piece-placement field only).
+    Returns None when no legal move explains the observed position.
+    """
+    target = after_fen.split()[0] if " " in after_fen else after_fen
+    for move in before.legal_moves:
+        test = before.copy()
+        test.push(move)
+        if test.board_fen() == target:
+            return move
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gemini Vision — automatic board-state reading
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GeminiVision:
+    """
+    Sends a board screenshot to Gemini Vision and returns the piece-placement
+    FEN string.  Used to verify / recover board state after each opponent move
+    so the internal chess.Board never drifts from what's on screen.
+
+    The screenshot is taken automatically — no manual steps required.
+    """
+
+    # Two prompt variants depending on which colour is at the bottom of the image.
+    _PROMPT_WHITE_BOTTOM = (
+        "This is a screenshot of a chess board. White pieces are at the BOTTOM.\n"
+        "Return ONLY the piece-placement field of the FEN (e.g. "
+        "'rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR').\n"
+        "Rules: uppercase = white (K Q R B N P), lowercase = black (k q r b n p), "
+        "digits = consecutive empty squares, 8 ranks separated by /, "
+        "rank 8 (far side) listed first.\n"
+        "Reply with the FEN placement string only — no other text."
+    )
+    _PROMPT_BLACK_BOTTOM = (
+        "This is a screenshot of a chess board. Black pieces are at the BOTTOM "
+        "(the board is shown from Black's perspective).\n"
+        "Return ONLY the piece-placement field of the FEN in STANDARD orientation "
+        "(rank 8 first, rank 1 last, as if White were at the bottom).\n"
+        "Example: 'rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR'\n"
+        "Rules: uppercase = white (K Q R B N P), lowercase = black (k q r b n p), "
+        "digits = consecutive empty squares.\n"
+        "Reply with the FEN placement string only — no other text."
+    )
+
+    def __init__(self, api_key: str, model: str = "gemini-2.0-flash") -> None:
+        try:
+            import google.generativeai as genai  # type: ignore[import]
+        except ImportError:
+            sys.exit(
+                "\nGemini Vision requires the Google AI SDK:\n"
+                "  pip install google-generativeai\n"
+            )
+        genai.configure(api_key=api_key)
+        self._model = genai.GenerativeModel(model)
+        self._sdk = genai
+
+    def board_fen_from_screenshot(
+        self,
+        board_img: np.ndarray,
+        flipped: bool = False,
+    ) -> Optional[str]:
+        """
+        Send *board_img* (numpy RGB array) to Gemini and return the
+        piece-placement FEN string, or None if the response is unparseable.
+        """
+        from PIL import Image  # type: ignore[import]
+
+        pil_img = Image.fromarray(board_img)
+        prompt  = self._PROMPT_BLACK_BOTTOM if flipped else self._PROMPT_WHITE_BOTTOM
+
+        try:
+            response = self._model.generate_content([prompt, pil_img])
+            raw = response.text.strip().strip("`").strip()
+
+            # Basic sanity check: 8 ranks separated by "/"
+            if raw.count("/") == 7:
+                return raw
+            # Gemini sometimes wraps in a code block — strip and retry
+            lines = [l.strip() for l in raw.splitlines() if l.strip()]
+            for line in lines:
+                if line.count("/") == 7:
+                    return line
+        except Exception as exc:
+            print(f"  [Gemini] {exc}")
+
+        return None
+
+    def get_move(
+        self,
+        board_img: np.ndarray,
+        board_before: chess.Board,
+    ) -> Optional[chess.Move]:
+        """
+        Capture the current board state via Gemini and return the move that
+        transitions *board_before* to the observed position.
+        Falls back to None when Gemini can't read the board.
+        """
+        placement = self.board_fen_from_screenshot(board_img, board_before.turn == chess.BLACK)
+        if placement is None:
+            return None
+        move = _move_from_board_diff(board_before, placement)
+        if move is None:
+            # Gemini may occasionally mis-read a piece; log and let the
+            # diff-based fallback handle it
+            print(f"  [Gemini] Returned placement '{placement}' matches no legal move.")
+        return move
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Move execution
 # ─────────────────────────────────────────────────────────────────────────────
@@ -544,37 +661,60 @@ def wait_for_opponent(
     board: chess.Board,
     timeout: float = 120.0,
     poll: float = 0.4,
+    gemini: Optional[GeminiVision] = None,
 ) -> Optional[chess.Move]:
     """
     Poll screenshots until the board changes, then return the inferred move.
-    Returns None if timeout expires without a valid move being detected.
-    """
-    baseline = grab_board(geo)
-    deadline = time.time() + timeout
-    stable_count = 0   # require N consistent detections to filter animation frames
 
+    When *gemini* is provided the workflow is:
+      1. Screenshot diff detects *when* something changed (fast, no API call).
+      2. Gemini Vision reads *what* the new position is (accurate, robust).
+      3. The move is inferred by comparing before/after board states.
+    Without Gemini the diff-based heuristic is used as before.
+
+    Returns None if the timeout expires.
+    """
+    baseline     = grab_board(geo)
+    deadline     = time.time() + timeout
+    stable_count = 0
     pending_move: Optional[chess.Move] = None
 
     while time.time() < deadline:
         time.sleep(poll)
-        current   = grab_board(geo)
-        squares   = changed_squares(baseline, current, geo)
+        current = grab_board(geo)
+        squares = changed_squares(baseline, current, geo)
 
-        if len(squares) >= 2:
+        if len(squares) < 2:
+            pending_move = None
+            stable_count = 0
+            continue
+
+        # Board has changed — try to identify the move
+        if gemini is not None:
+            # Let the animation settle for one extra poll before asking Gemini
+            time.sleep(poll)
+            current = grab_board(geo)
+            move = gemini.get_move(current, board)
+            if move is not None:
+                if move == pending_move:
+                    stable_count += 1
+                else:
+                    pending_move = move
+                    stable_count = 1
+                if stable_count >= 2:
+                    return move
+            # Gemini failed this frame — keep polling
+        else:
+            # Diff-only fallback
             move = infer_move(squares, board)
             if move is not None:
                 if move == pending_move:
                     stable_count += 1
                 else:
-                    pending_move  = move
-                    stable_count  = 1
-
-                # Confirm after 2 consecutive identical readings
+                    pending_move = move
+                    stable_count = 1
                 if stable_count >= 2:
                     return move
-        else:
-            pending_move = None
-            stable_count = 0
 
     return None
 
@@ -583,13 +723,22 @@ def wait_for_opponent(
 # Main game loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-def play(bot: object, play_as: str = "white", think_time: float = 5.0) -> None:
+def play(
+    bot: object,
+    play_as: str = "white",
+    think_time: float = 5.0,
+    gemini_key: Optional[str] = None,
+    gemini_model: str = "gemini-2.0-flash",
+) -> None:
     """
     Physically play a full game against macOS Chess.
 
-    bot       : a ChessBot instance (from chess_bot.py)
-    play_as   : 'white' or 'black'
-    think_time: seconds Stockfish gets per move
+    bot         : a ChessBot instance (from chess_bot.py)
+    play_as     : 'white' or 'black'
+    think_time  : seconds Stockfish gets per move
+    gemini_key  : Gemini API key; if provided, Gemini Vision reads the board
+                  after every opponent move for accurate state tracking
+    gemini_model: which Gemini model to use (default: gemini-2.0-flash)
     """
     setup_game(play_as)
 
@@ -608,6 +757,14 @@ def play(bot: object, play_as: str = "white", think_time: float = 5.0) -> None:
 
     # Visually trace the board corners — user can confirm it's correct
     calibrate(geo)
+
+    # Initialise Gemini Vision if a key was supplied
+    gemini: Optional[GeminiVision] = None
+    if gemini_key:
+        print("Gemini Vision  : enabled — board state verified after each opponent move")
+        gemini = GeminiVision(api_key=gemini_key, model=gemini_model)
+    else:
+        print("Gemini Vision  : disabled (pass --gemini-key to enable)\n")
 
     bot_color = chess.WHITE if play_as == "white" else chess.BLACK
 
@@ -634,7 +791,9 @@ def play(bot: object, play_as: str = "white", think_time: float = 5.0) -> None:
             move_num = current_board.fullmove_number
             print(f"[{move_num}] Waiting for opponent…", flush=True)
 
-            opponent_move = wait_for_opponent(geo, current_board, timeout=120.0)
+            opponent_move = wait_for_opponent(
+                geo, current_board, timeout=120.0, gemini=gemini
+            )
 
             if opponent_move is None:
                 print("Timed out waiting for opponent. Stopping.")

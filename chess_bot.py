@@ -406,10 +406,17 @@ def suggest_mode(bot: ChessBot, macos: MacOSChessInterface) -> None:
         print("\nStopped.")
 
 
-def auto_mode(bot: ChessBot, play_as: str = "white") -> None:
+def auto_mode(
+    bot: ChessBot,
+    play_as: str = "white",
+    gemini_key: Optional[str] = None,
+    gemini_model: str = "gemini-2.0-flash",
+) -> None:
     """
     Physically control macOS Chess — reads the board via screenshots,
     clicks pieces to make moves, and waits for the opponent via screen diff.
+    When gemini_key is provided, Gemini Vision verifies the board state after
+    every opponent move so the internal board never drifts from reality.
     play_as: 'white' | 'black'
     """
     try:
@@ -422,7 +429,13 @@ def auto_mode(bot: ChessBot, play_as: str = "white") -> None:
         )
 
     try:
-        gui_play(bot, play_as=play_as, think_time=bot.think_time)
+        gui_play(
+            bot,
+            play_as=play_as,
+            think_time=bot.think_time,
+            gemini_key=gemini_key,
+            gemini_model=gemini_model,
+        )
     except KeyboardInterrupt:
         print("\nStopped.")
 
@@ -490,11 +503,30 @@ examples:
         default=None,
         help="Explicit path to the Stockfish binary",
     )
+    p.add_argument(
+        "--gemini-key",
+        metavar="KEY",
+        default=None,
+        help=(
+            "Gemini API key for Vision-based board detection (auto mode only). "
+            "Can also be set via the GEMINI_API_KEY environment variable."
+        ),
+    )
+    p.add_argument(
+        "--gemini-model",
+        metavar="MODEL",
+        default="gemini-2.0-flash",
+        help="Gemini model to use (default: gemini-2.0-flash)",
+    )
     return p
 
 
 def main() -> None:
+    import os
     args = _build_parser().parse_args()
+
+    # Gemini key: CLI flag takes priority, then environment variable
+    gemini_key = args.gemini_key or os.environ.get("GEMINI_API_KEY")
 
     with ChessBot(
         stockfish_path=args.stockfish,
@@ -507,7 +539,7 @@ def main() -> None:
         elif args.mode == "suggest":
             suggest_mode(bot, MacOSChessInterface())
         elif args.mode == "auto":
-            auto_mode(bot, args.color)
+            auto_mode(bot, args.color, gemini_key=gemini_key, gemini_model=args.gemini_model)
 
 
 if __name__ == "__main__":
