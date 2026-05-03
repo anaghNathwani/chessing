@@ -303,56 +303,104 @@ def get_window_bounds() -> tuple[int, int, int, int]:
 # Board detection
 # ─────────────────────────────────────────────────────────────────────────────
 
-# macOS Chess 2D square colours (approximate)
-_LIGHT_LO = np.array([190, 165, 130], dtype=np.float32)
-_LIGHT_HI = np.array([255, 235, 210], dtype=np.float32)
-_DARK_LO  = np.array([120,  85,  50], dtype=np.float32)
-_DARK_HI  = np.array([200, 160, 120], dtype=np.float32)
+# macOS Chess 2D square colours — wider ranges to survive theme/brightness
+# differences.  Light squares: warm cream; dark squares: warm brown.
+_LIGHT_LO = np.array([160, 130,  90], dtype=np.float32)
+_LIGHT_HI = np.array([255, 248, 220], dtype=np.float32)
+_DARK_LO  = np.array([ 90,  55,  25], dtype=np.float32)
+_DARK_HI  = np.array([210, 165, 120], dtype=np.float32)
 
 
 def _is_board_pixel(pixel: np.ndarray) -> bool:
     p = pixel[:3].astype(np.float32)
+    # Require red > blue (warm tone) to reduce false positives from grey UI chrome
+    if p[0] <= p[2]:
+        return False
     light = np.all(p >= _LIGHT_LO) and np.all(p <= _LIGHT_HI)
     dark  = np.all(p >= _DARK_LO)  and np.all(p <= _DARK_HI)
     return light or dark
 
 
+def _screen_scale() -> float:
+    """
+    Retina pixel scale factor.
+    pyautogui.screenshot() returns physical pixels; window bounds from
+    AppleScript are logical points.  On standard Retina this is 2.0.
+    """
+    img = pyautogui.screenshot(region=(0, 0, 10, 10))
+    return img.width / 10.0
+
+
 def detect_board(wx: int, wy: int, ww: int, wh: int) -> BoardGeometry:
     """
-    Find the chessboard within the Chess.app window by scanning for the
-    characteristic light/dark square colour pattern.
-    Falls back to a window-based heuristic if colour detection fails.
-    """
-    img = np.array(pyautogui.screenshot(region=(wx, wy, ww, wh)))
+    Find the chessboard within the Chess.app window.
 
-    # Scan the horizontal centre of the window for board-coloured pixels
-    scan_y = wh // 2
+    Screenshots come back in *physical* pixels; window bounds are *logical*
+    points.  We work entirely in physical space during detection, then divide
+    by the scale factor before returning logical coords for clicking.
+    """
+    scale = _screen_scale()
+    screenshot = pyautogui.screenshot(region=(wx, wy, ww, wh))
+    img = np.array(screenshot)          # shape: (wh*scale, ww*scale, 3)
+    ph, pw = img.shape[:2]              # physical pixel dimensions
+
+    # ── Horizontal scan (find left/right board edges) ────────────────────────
+    scan_y = ph // 2
     row = img[scan_y]
     board_cols = [x for x, px in enumerate(row) if _is_board_pixel(px)]
 
-    if len(board_cols) >= 8:
-        left  = min(board_cols)
-        right = max(board_cols)
-        width = right - left
+    if len(board_cols) >= int(8 * scale):   # found enough board pixels
+        left_px  = min(board_cols)
+        right_px = max(board_cols)
+        width_px = right_px - left_px
     else:
-        # Heuristic fallback — board fills ~90 % of the window width
-        width = int(min(ww, wh) * 0.90)
-        left  = (ww - width) // 2
+        # Heuristic: board fills ~90 % of the shorter window dimension
+        width_px = int(min(pw, ph) * 0.90)
+        left_px  = (pw - width_px) // 2
 
-    # Scan vertically at the horizontal centre of the detected board
-    scan_x = left + width // 2
+    # ── Vertical scan (find top/bottom board edges) ──────────────────────────
+    scan_x = left_px + width_px // 2
     col = img[:, scan_x]
     board_rows = [y for y, px in enumerate(col) if _is_board_pixel(px)]
 
-    if len(board_rows) >= 8:
-        top    = min(board_rows)
-        height = max(board_rows) - top
+    if len(board_rows) >= int(8 * scale):
+        top_px    = min(board_rows)
+        height_px = max(board_rows) - top_px
     else:
-        height = width
-        top    = (wh - height) // 2
+        height_px = width_px
+        top_px    = (ph - height_px) // 2
 
-    size = (width + height) // 2   # average in case of slight asymmetry
-    return BoardGeometry(x=wx + left, y=wy + top, size=size)
+    # Average width/height to get the square board size
+    size_px = (width_px + height_px) // 2
+
+    # ── Convert physical pixels → logical screen coords ──────────────────────
+    # AppleScript and pyautogui.click() both use logical points; only
+    # pyautogui.screenshot() returns physical pixels, hence the division.
+    board_x    = wx + round(left_px  / scale)
+    board_y    = wy + round(top_px   / scale)
+    board_size = round(size_px / scale)
+
+    return BoardGeometry(x=board_x, y=board_y, size=board_size)
+
+
+def calibrate(geo: BoardGeometry) -> None:
+    """
+    Slowly move the mouse around the four corners of the detected board so
+    the user can confirm the detection is correct before the game begins.
+    """
+    corners = [
+        ("a1", geo.to_pixel(chess.A1)),
+        ("a8", geo.to_pixel(chess.A8)),
+        ("h8", geo.to_pixel(chess.H8)),
+        ("h1", geo.to_pixel(chess.H1)),
+        ("a1", geo.to_pixel(chess.A1)),   # close the loop
+    ]
+    print("Tracing board corners to verify detection (a1→a8→h8→h1)…")
+    for label, (x, y) in corners:
+        pyautogui.moveTo(x, y, duration=0.5)
+        time.sleep(0.2)
+    print("  Corners traced.  If the mouse outlined the board correctly, "
+          "detection is good.\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -374,17 +422,22 @@ def changed_squares(
     """
     Return the chess squares where the average pixel value changed significantly
     between two board screenshots.  These are the squares involved in a move.
+
+    Works directly in physical pixel space (image dimensions) so results are
+    correct regardless of Retina scale factor.
     """
-    sq = int(geo.sq_px)
+    h, w = before.shape[:2]    # physical pixel dimensions of the captured board
+    sq_h = h / 8
+    sq_w = w / 8
     result: list[chess.Square] = []
 
     for rank in range(8):
         for file in range(8):
-            r0, r1 = rank * sq, (rank + 1) * sq
-            c0, c1 = file * sq, (file + 1) * sq
+            r0 = int(rank       * sq_h);  r1 = int((rank + 1) * sq_h)
+            c0 = int(file       * sq_w);  c1 = int((file + 1) * sq_w)
             diff = np.abs(
                 before[r0:r1, c0:c1].astype(np.float32) -
-                after[r0:r1, c0:c1].astype(np.float32)
+                after[r0:r1,  c0:c1].astype(np.float32)
             ).mean()
             if diff > threshold:
                 if not geo.flipped:
@@ -448,14 +501,18 @@ def infer_move(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def click_move(move: chess.Move, geo: BoardGeometry) -> None:
-    """Click the source square, then the destination square."""
+    """Bring Chess.app to front, then click source square → destination square."""
+    # Chess must own the mouse events or the clicks are silently dropped
+    _applescript('tell application "Chess" to activate')
+    time.sleep(0.25)
+
     sx, sy = geo.to_pixel(move.from_square)
     dx, dy = geo.to_pixel(move.to_square)
 
-    pyautogui.moveTo(sx, sy, duration=0.12)
+    pyautogui.moveTo(sx, sy, duration=0.20)
     pyautogui.click()
-    time.sleep(0.30)
-    pyautogui.moveTo(dx, dy, duration=0.12)
+    time.sleep(0.40)
+    pyautogui.moveTo(dx, dy, duration=0.20)
     pyautogui.click()
 
 
@@ -536,19 +593,23 @@ def play(bot: object, play_as: str = "white", think_time: float = 5.0) -> None:
     """
     setup_game(play_as)
 
+    # Let the board fully render after new-game setup
+    time.sleep(1.5)
+
     wx, wy, ww, wh = get_window_bounds()
     geo = detect_board(wx, wy, ww, wh)
     geo.flipped = play_as == "black"
 
-    print(f"Board detected  : origin=({geo.x}, {geo.y})  size={geo.size}px")
+    print(f"Board detected  : origin=({geo.x}, {geo.y})  size={geo.size}px  "
+          f"sq={geo.sq_px:.1f}px")
     print(f"Bot plays       : {play_as.capitalize()}")
     print(f"Think time      : {think_time}s per move")
-    print("Move mouse to top-left corner at any time to abort (pyautogui fail-safe).\n")
+    print("Fail-safe       : move mouse to top-left corner to abort\n")
+
+    # Visually trace the board corners — user can confirm it's correct
+    calibrate(geo)
 
     bot_color = chess.WHITE if play_as == "white" else chess.BLACK
-
-    # Brief pause to let the board fully render after setup
-    time.sleep(1.0)
 
     while not bot.is_game_over:  # type: ignore[attr-defined]
         current_board: chess.Board = bot.board  # type: ignore[attr-defined]
