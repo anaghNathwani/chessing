@@ -15,6 +15,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import time
+import json as _json
 from dataclasses import dataclass
 from typing import Optional
 
@@ -332,34 +333,52 @@ def _screen_scale() -> float:
     return img.width / 10.0
 
 
-def detect_board(wx: int, wy: int, ww: int, wh: int) -> BoardGeometry:
+def detect_board(
+    wx: int, wy: int, ww: int, wh: int,
+    gemini: Optional["GeminiVision"] = None,
+) -> BoardGeometry:
     """
     Find the chessboard within the Chess.app window.
 
+    When *gemini* is provided it is asked first — it can locate the board in
+    any theme (2D, 3D, custom colours) without any hardcoded assumptions.
+    Falls back to colour-scanning when Gemini is unavailable or fails.
+
     Screenshots come back in *physical* pixels; window bounds are *logical*
-    points.  We work entirely in physical space during detection, then divide
-    by the scale factor before returning logical coords for clicking.
+    points.  All detected pixel offsets are divided by the scale factor before
+    being stored so that to_pixel() returns correct logical coords for clicking.
     """
     scale = _screen_scale()
     screenshot = pyautogui.screenshot(region=(wx, wy, ww, wh))
     img = np.array(screenshot)          # shape: (wh*scale, ww*scale, 3)
-    ph, pw = img.shape[:2]              # physical pixel dimensions
+    ph, pw = img.shape[:2]
 
-    # ── Horizontal scan (find left/right board edges) ────────────────────────
+    # ── Strategy 1: ask Gemini (works with any board style) ──────────────────
+    if gemini is not None:
+        rect = gemini.find_board(img)
+        if rect:
+            x_px, y_px, w_px, h_px = rect
+            size_px = (w_px + h_px) // 2
+            return BoardGeometry(
+                x    = wx + round(x_px   / scale),
+                y    = wy + round(y_px   / scale),
+                size = round(size_px / scale),
+            )
+        print("  [Gemini] Board detection failed — falling back to colour scan.")
+
+    # ── Strategy 2: colour-based scan ────────────────────────────────────────
     scan_y = ph // 2
     row = img[scan_y]
     board_cols = [x for x, px in enumerate(row) if _is_board_pixel(px)]
 
-    if len(board_cols) >= int(8 * scale):   # found enough board pixels
+    if len(board_cols) >= int(8 * scale):
         left_px  = min(board_cols)
         right_px = max(board_cols)
         width_px = right_px - left_px
     else:
-        # Heuristic: board fills ~90 % of the shorter window dimension
         width_px = int(min(pw, ph) * 0.90)
         left_px  = (pw - width_px) // 2
 
-    # ── Vertical scan (find top/bottom board edges) ──────────────────────────
     scan_x = left_px + width_px // 2
     col = img[:, scan_x]
     board_rows = [y for y, px in enumerate(col) if _is_board_pixel(px)]
@@ -371,17 +390,12 @@ def detect_board(wx: int, wy: int, ww: int, wh: int) -> BoardGeometry:
         height_px = width_px
         top_px    = (ph - height_px) // 2
 
-    # Average width/height to get the square board size
     size_px = (width_px + height_px) // 2
-
-    # ── Convert physical pixels → logical screen coords ──────────────────────
-    # AppleScript and pyautogui.click() both use logical points; only
-    # pyautogui.screenshot() returns physical pixels, hence the division.
-    board_x    = wx + round(left_px  / scale)
-    board_y    = wy + round(top_px   / scale)
-    board_size = round(size_px / scale)
-
-    return BoardGeometry(x=board_x, y=board_y, size=board_size)
+    return BoardGeometry(
+        x    = wx + round(left_px  / scale),
+        y    = wy + round(top_px   / scale),
+        size = round(size_px / scale),
+    )
 
 
 def calibrate(geo: BoardGeometry) -> None:
@@ -516,37 +530,31 @@ def _move_from_board_diff(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Gemini Vision — automatic board-state reading
+# Gemini Vision — primary sensor for all screen-reading tasks
 # ─────────────────────────────────────────────────────────────────────────────
 
 class GeminiVision:
     """
-    Sends a board screenshot to Gemini Vision and returns the piece-placement
-    FEN string.  Used to verify / recover board state after each opponent move
-    so the internal chess.Board never drifts from what's on screen.
+    Uses Gemini Vision as the single source of truth for everything visual:
 
-    The screenshot is taken automatically — no manual steps required.
+      • find_board()           – locates the 8×8 grid anywhere on screen,
+                                 replacing the fragile colour-scanning approach
+      • read_state()           – returns FEN + game-over flag in one call,
+                                 works with any board theme (2D, 3D, custom)
+      • find_promotion_click() – finds exactly where to click in the promotion
+                                 picker, replacing hardcoded pixel offsets
+      • get_move()             – convenience wrapper used by wait_for_opponent
+
+    All responses are structured JSON at temperature=0 so parsing is reliable.
+    Screenshots are taken automatically — no user interaction required.
     """
 
-    # Two prompt variants depending on which colour is at the bottom of the image.
-    _PROMPT_WHITE_BOTTOM = (
-        "This is a screenshot of a chess board. White pieces are at the BOTTOM.\n"
-        "Return ONLY the piece-placement field of the FEN (e.g. "
-        "'rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR').\n"
-        "Rules: uppercase = white (K Q R B N P), lowercase = black (k q r b n p), "
-        "digits = consecutive empty squares, 8 ranks separated by /, "
-        "rank 8 (far side) listed first.\n"
-        "Reply with the FEN placement string only — no other text."
-    )
-    _PROMPT_BLACK_BOTTOM = (
-        "This is a screenshot of a chess board. Black pieces are at the BOTTOM "
-        "(the board is shown from Black's perspective).\n"
-        "Return ONLY the piece-placement field of the FEN in STANDARD orientation "
-        "(rank 8 first, rank 1 last, as if White were at the bottom).\n"
-        "Example: 'rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR'\n"
-        "Rules: uppercase = white (K Q R B N P), lowercase = black (k q r b n p), "
-        "digits = consecutive empty squares.\n"
-        "Reply with the FEN placement string only — no other text."
+    _SYSTEM = (
+        "You are an expert chess vision system embedded in a chess bot. "
+        "You analyse screenshots of macOS Chess.app and return precise JSON. "
+        "You have deep knowledge of chess piece appearances in both 2D and 3D "
+        "board styles. Every pixel-coordinate or FEN error costs the game, "
+        "so be exact. Never add explanation — return only valid JSON."
     )
 
     def __init__(self, api_key: str, model: str = "gemini-2.0-flash") -> None:
@@ -559,58 +567,132 @@ class GeminiVision:
                 "  python3 -m pip install google-generativeai\n"
             )
         genai.configure(api_key=api_key)
-        self._model = genai.GenerativeModel(model)
-        self._sdk = genai
+        self._model = genai.GenerativeModel(
+            model_name=model,
+            system_instruction=self._SYSTEM,
+        )
 
-    def board_fen_from_screenshot(
+    # ── Internal helper ───────────────────────────────────────────────────────
+
+    def _ask(self, img: np.ndarray, prompt: str) -> Optional[dict]:
+        """
+        Send *img* to Gemini with *prompt* and return the parsed JSON dict.
+        Uses response_mime_type='application/json' and temperature=0 so the
+        output is deterministic and always well-formed JSON.
+        """
+        from PIL import Image  # type: ignore[import]
+        pil = Image.fromarray(img)
+        try:
+            resp = self._model.generate_content(
+                [prompt, pil],
+                generation_config={
+                    "response_mime_type": "application/json",
+                    "temperature": 0.0,
+                },
+            )
+            return _json.loads(resp.text)
+        except Exception as exc:
+            print(f"  [Gemini] {exc}")
+            return None
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def find_board(self, window_img: np.ndarray) -> Optional[tuple[int, int, int, int]]:
+        """
+        Locate the 8×8 chessboard in a full window screenshot.
+        Returns (x, y, width, height) in image pixels, or None on failure.
+
+        This replaces colour-based board detection and works with any board
+        theme — the bot no longer needs hardcoded colour ranges.
+        """
+        data = self._ask(
+            window_img,
+            "Find the 8×8 chessboard grid in this macOS Chess.app screenshot. "
+            "Exclude the window title bar, toolbar, and any status areas. "
+            'Return JSON: {"x": left_pixel, "y": top_pixel, '
+            '"w": width_pixels, "h": height_pixels}',
+        )
+        if data and all(k in data for k in ("x", "y", "w", "h")):
+            return int(data["x"]), int(data["y"]), int(data["w"]), int(data["h"])
+        return None
+
+    def read_state(
         self,
         board_img: np.ndarray,
         flipped: bool = False,
-    ) -> Optional[str]:
+    ) -> Optional[dict]:
         """
-        Send *board_img* (numpy RGB array) to Gemini and return the
-        piece-placement FEN string, or None if the response is unparseable.
+        Read the complete game state from a board screenshot in a single call.
+
+        Returns a dict with keys:
+          "fen"       – piece-placement field (e.g. 'rnbqkbnr/pppppppp/8/8/…')
+          "game_over" – true when the game has ended
+          "result"    – null | "1-0" | "0-1" | "1/2-1/2"
+
+        flipped=True means Black's pieces are at the bottom of the image.
+        Works with 2D and 3D board styles, any colour theme.
         """
-        from PIL import Image  # type: ignore[import]
+        side = "Black" if flipped else "White"
+        data = self._ask(
+            board_img,
+            f"{side} pieces are at the bottom of the image. "
+            "Analyse this chess position carefully — every piece matters. "
+            "Return JSON with these exact keys:\n"
+            '{"fen": "<piece_placement_only>", "game_over": false, "result": null}\n'
+            "FEN rules: uppercase=white (K Q R B N P), lowercase=black (k q r b n p), "
+            "digits=consecutive empty squares, ranks 8→1 separated by /. "
+            'Set game_over=true and result to "1-0", "0-1", or "1/2-1/2" '
+            "only when the game has actually ended.",
+        )
+        if (
+            data
+            and isinstance(data.get("fen"), str)
+            and data["fen"].count("/") == 7
+        ):
+            return data
+        return None
 
-        pil_img = Image.fromarray(board_img)
-        prompt  = self._PROMPT_BLACK_BOTTOM if flipped else self._PROMPT_WHITE_BOTTOM
+    def find_promotion_click(
+        self,
+        board_img: np.ndarray,
+        piece: str = "queen",
+    ) -> Optional[tuple[int, int]]:
+        """
+        After a pawn reaches the last rank, a piece-picker appears.
+        Returns the (x, y) pixel within *board_img* to click for *piece*,
+        or None if the picker isn't visible.
 
-        try:
-            response = self._model.generate_content([prompt, pil_img])
-            raw = response.text.strip().strip("`").strip()
-
-            # Basic sanity check: 8 ranks separated by "/"
-            if raw.count("/") == 7:
-                return raw
-            # Gemini sometimes wraps in a code block — strip and retry
-            lines = [l.strip() for l in raw.splitlines() if l.strip()]
-            for line in lines:
-                if line.count("/") == 7:
-                    return line
-        except Exception as exc:
-            print(f"  [Gemini] {exc}")
-
+        This replaces hardcoded offsets that broke on non-default window sizes.
+        """
+        data = self._ask(
+            board_img,
+            f"A pawn-promotion piece picker is visible on this chess board. "
+            f"Find the centre of the {piece} option and return its pixel "
+            f'coordinates within this image. JSON: {{"x": pixel_x, "y": pixel_y}} '
+            f"If no promotion picker is visible return null.",
+        )
+        if data and "x" in data and "y" in data:
+            return int(data["x"]), int(data["y"])
         return None
 
     def get_move(
         self,
         board_img: np.ndarray,
         board_before: chess.Board,
+        flipped: bool = False,
     ) -> Optional[chess.Move]:
         """
-        Capture the current board state via Gemini and return the move that
-        transitions *board_before* to the observed position.
-        Falls back to None when Gemini can't read the board.
+        Read the current board state from *board_img* and return the legal move
+        that transitions *board_before* to the observed position.
+        Returns None when Gemini can't read the board or no legal move matches.
         """
-        placement = self.board_fen_from_screenshot(board_img, board_before.turn == chess.BLACK)
-        if placement is None:
+        state = self.read_state(board_img, flipped=flipped)
+        if state is None:
             return None
-        move = _move_from_board_diff(board_before, placement)
+        move = _move_from_board_diff(board_before, state["fen"])
         if move is None:
-            # Gemini may occasionally mis-read a piece; log and let the
-            # diff-based fallback handle it
-            print(f"  [Gemini] Returned placement '{placement}' matches no legal move.")
+            print(f"  [Gemini] FEN '{state['fen']}' matches no legal move — "
+                  "will retry next poll.")
         return move
 
 
@@ -634,22 +716,47 @@ def click_move(move: chess.Move, geo: BoardGeometry) -> None:
     pyautogui.click()
 
 
-def handle_promotion(geo: BoardGeometry, piece: int = chess.QUEEN) -> None:
+def handle_promotion(
+    geo: BoardGeometry,
+    piece: int = chess.QUEEN,
+    gemini: Optional["GeminiVision"] = None,
+) -> None:
     """
     Click the correct piece in macOS Chess's promotion picker.
-    The picker appears at the promotion rank; pieces are ordered
-    Queen → Rook → Bishop → Knight from left (or right when flipped).
+
+    When *gemini* is provided it takes a screenshot of the board and asks
+    Gemini exactly where the promotion picker is — no hardcoded offsets.
+    Falls back to a positional heuristic when Gemini is unavailable.
     """
-    time.sleep(0.65)
+    time.sleep(0.65)   # wait for the picker to fully appear
+
+    piece_names = {
+        chess.QUEEN: "queen", chess.ROOK: "rook",
+        chess.BISHOP: "bishop", chess.KNIGHT: "knight",
+    }
+    piece_name = piece_names.get(piece, "queen")
+
+    # ── Strategy 1: ask Gemini where to click ────────────────────────────────
+    if gemini is not None:
+        img = grab_board(geo)
+        click_pos = gemini.find_promotion_click(img, piece_name)
+        if click_pos:
+            scale = _screen_scale()
+            px = geo.x + round(click_pos[0] / scale)
+            py = geo.y + round(click_pos[1] / scale)
+            pyautogui.moveTo(px, py, duration=0.15)
+            pyautogui.click()
+            return
+
+    # ── Strategy 2: positional heuristic ─────────────────────────────────────
     order = [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]
-    idx = order.index(piece) if piece in order else 0
-
+    idx   = order.index(piece) if piece in order else 0
     sq_px = int(geo.sq_px)
-    # The picker row appears roughly at the top of the board for white promotions
-    picker_y = geo.y + sq_px // 2
-    picker_x = geo.x + idx * sq_px + sq_px // 2
-
-    pyautogui.moveTo(picker_x, picker_y, duration=0.1)
+    pyautogui.moveTo(
+        geo.x + idx * sq_px + sq_px // 2,
+        geo.y + sq_px // 2,
+        duration=0.15,
+    )
     pyautogui.click()
 
 
@@ -695,7 +802,7 @@ def wait_for_opponent(
             # Let the animation settle for one extra poll before asking Gemini
             time.sleep(poll)
             current = grab_board(geo)
-            move = gemini.get_move(current, board)
+            move = gemini.get_move(current, board, flipped=geo.flipped)
             if move is not None:
                 if move == pending_move:
                     stable_count += 1
@@ -746,8 +853,17 @@ def play(
     # Let the board fully render after new-game setup
     time.sleep(1.5)
 
+    # Initialise Gemini Vision if a key was supplied
+    gemini: Optional[GeminiVision] = None
+    if gemini_key:
+        gemini = GeminiVision(api_key=gemini_key, model=gemini_model)
+        print("Gemini Vision  : enabled (board find + state read + promotion)")
+    else:
+        print("Gemini Vision  : disabled (pass --gemini-key to enable)")
+
     wx, wy, ww, wh = get_window_bounds()
-    geo = detect_board(wx, wy, ww, wh)
+    # Gemini locates the board; colour-scan is the fallback
+    geo = detect_board(wx, wy, ww, wh, gemini=gemini)
     geo.flipped = play_as == "black"
 
     print(f"Board detected  : origin=({geo.x}, {geo.y})  size={geo.size}px  "
@@ -756,21 +872,20 @@ def play(
     print(f"Think time      : {think_time}s per move")
     print("Fail-safe       : move mouse to top-left corner to abort\n")
 
-    # Visually trace the board corners — user can confirm it's correct
     calibrate(geo)
-
-    # Initialise Gemini Vision if a key was supplied
-    gemini: Optional[GeminiVision] = None
-    if gemini_key:
-        print("Gemini Vision  : enabled — board state verified after each opponent move")
-        gemini = GeminiVision(api_key=gemini_key, model=gemini_model)
-    else:
-        print("Gemini Vision  : disabled (pass --gemini-key to enable)\n")
 
     bot_color = chess.WHITE if play_as == "white" else chess.BLACK
 
     while not bot.is_game_over:  # type: ignore[attr-defined]
         current_board: chess.Board = bot.board  # type: ignore[attr-defined]
+
+        # ── Check for game over via Gemini (catches checkmate dialogs etc.) ──
+        if gemini is not None:
+            state = gemini.read_state(grab_board(geo), flipped=geo.flipped)
+            if state and state.get("game_over"):
+                result = state.get("result") or "unknown"
+                print(f"\nGemini detected game over — result: {result}")
+                break
 
         if current_board.turn == bot_color:
             move_num = current_board.fullmove_number
@@ -782,7 +897,7 @@ def play(
             click_move(move, geo)
 
             if move.promotion:
-                handle_promotion(geo, move.promotion)
+                handle_promotion(geo, move.promotion, gemini=gemini)
 
             current_board.push(move)
             print(f"     Bot played : {san}")
